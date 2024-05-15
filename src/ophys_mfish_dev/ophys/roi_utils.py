@@ -124,9 +124,7 @@ def reorder_mask_im(mask_im):
     mask_im: input mask. Must be 2 dimensional    
     '''
     assert len(mask_im.shape) == 2
-    num_rois = len(np.unique(mask_im))
     if len(np.unique(mask_im)) - 1 != mask_im.max():
-        num_rois = len(np.unique(mask_im))
         old_ids = np.setdiff1d(mask_im.unique(), 0)
         new_mask_im = np.zeros(mask_im.shape)
         for i, old_id in enumerate(old_ids):
@@ -135,6 +133,7 @@ def reorder_mask_im(mask_im):
         return new_mask_im
     else:
         return mask_im
+    
 
 def make_3d_mask_from_2d(mask_im):
 # make a 3d mask from 2d mask
@@ -172,7 +171,155 @@ def get_2d_mask_from_3d(mask_3d):
     # for now, assign higher index value
     mask_2d = np.argmax(mask_3d, axis=0)
 
-    return mask_2d    
+    return mask_2d
+
+
+###############
+# ROI collation
+# TODO: needs test
+
+def collate_masks(mask_3d1, mask_3d2, iou_threshold=0.3):
+    """Collate two masks into one.
+    Plus, calculate unique ROIs going forward and backward (from mask_3d1 to mask_3d2 and vice versa)
+    using IoU threshold
+    """
+    assert len(mask_3d1.shape) == len(mask_3d2.shape) == 3
+    if mask_3d1.shape[0] == 0:
+        if mask_3d2.shape[0] == 0:
+            return np.zeros((0, mask_3d1.shape[1], mask_3d1.shape[2]), dtype=np.uint16), (0,0)
+        else:
+            return mask_3d2, (mask_3d2.shape[0], 0)
+    elif mask_3d2.shape[0] == 0:
+        return mask_3d1, (0, mask_3d1.shape[0])
+    else:
+        assert mask_3d1.max() == mask_3d1.shape[0]
+        assert mask_3d2.max() == mask_3d2.shape[0]
+    iou_mat, ioa_mat1, ioa_mat2 = get_iou_ioa_mat(mask_3d1, mask_3d2)
+
+    num_unique_in_mask1 = len(np.where(np.sum(iou_mat >= iou_threshold, axis=1) == 0)[0])
+    num_unique_in_mask2 = len(np.where(np.sum(iou_mat >= iou_threshold, axis=0) == 0)[0])
+
+    ind_remove_from_mask1, ind_remove_from_mask2, \
+        ioa_mat1, ioa_mat2 = deal_with_multi_overlap(ioa_mat1, ioa_mat2,
+                                                    mask_3d1, mask_3d2)
+    ind_remove_from_mask1, ind_remove_from_mask2 \
+        = deal_with_one_to_one(ioa_mat1, ioa_mat2, mask_3d1, mask_3d2,
+                               ind_remove_from_mask1, ind_remove_from_mask2)
+    new_mask = clean_and_merge_masks(mask_3d1, mask_3d2, 
+                                     ind_remove_from_mask1,
+                                     ind_remove_from_mask2)
+    return new_mask, (num_unique_in_mask1, num_unique_in_mask2), (ind_remove_from_mask1, ind_remove_from_mask2)
+
+
+def get_iou_ioa_mat(mask_3d1, mask_3d2):
+    assert len(mask_3d1.shape) == len(mask_3d2.shape) == 3
+    assert mask_3d1.max() == mask_3d1.shape[0]
+    assert mask_3d2.max() == mask_3d2.shape[0]
+
+    iou_mat = np.zeros((mask_3d1.shape[0], mask_3d2.shape[0])) # intersection / union
+    ioa_mat1 = np.zeros((mask_3d1.shape[0], mask_3d2.shape[0])) # intersection / area of mask1 ROI
+    ioa_mat2 = np.zeros((mask_3d1.shape[0], mask_3d2.shape[0])) # intersection / area of mask2 ROI
+
+    for i in range(mask_3d1.shape[0]):
+        for j in range(mask_3d2.shape[0]):
+            intersection_map = mask_3d1[i] * mask_3d2[j] > 0
+            if intersection_map.any():
+                union_map = mask_3d1[i] + mask_3d2[j] > 0
+                iou_mat[i,j] = np.sum(intersection_map) / np.sum(union_map)
+                ioa_mat1[i,j] = np.sum(intersection_map) / np.sum(mask_3d1)
+                ioa_mat2[i,j] = np.sum(intersection_map) / np.sum(mask_3d2)
+    #TODO: needs validation in edge cases?
+    return iou_mat, ioa_mat1, ioa_mat2
+
+
+def deal_with_multi_overlap(ioa_mat1, ioa_mat2, mask_3d1, mask_3d2, ioa_threshold=0.5):
+    assert len(mask_3d1.shape) == len(mask_3d2.shape) == 3
+    assert mask_3d1.max() == mask_3d1.shape[2]
+    assert mask_3d2.max() == mask_3d2.shape[2]
+    # Only care about multi-to-one, since that was the only cases that I've seen.
+    # When there are multiple rois from mask2 that overlap with one roi from mask1
+    multi_ind1 = np.where(np.sum(ioa_mat2 >= ioa_threshold, axis=1)>1)[0]
+    # When there are multiple rois from mask1 that overlap with one roi from mask2
+    multi_ind2 = np.where(np.sum(ioa_mat1 >= ioa_threshold, axis=0)>1)[0]
+    # These two are assumed to be disjoint, because there was no multi-to-multi case
+
+    area_dist1 = np.array([np.sum(mask_3d1[i]) for i in range(mask_3d1.shape[0])])
+    area_dist2 = np.array([np.sum(mask_3d2[i]) for i in range(mask_3d2.shape[0])])
+    area_dist = np.concatenate([area_dist1, area_dist2])
+
+    ind_remove_from_mask1 = []
+    ind_remove_from_mask2 = []
+
+    for ind in multi_ind1:
+        temp_overlap_roi_inds2 = np.where(ioa_mat2[ind,:] >= ioa_threshold)[0]
+        # pick the one(s) with closer to median area
+        percentile_to_med1 = np.abs(0.5 - np.sum(area_dist < area_dist1[ind])/len(area_dist))
+        percentile_to_med2 = [np.abs(0.5 - np.sum(area_dist < area_dist2[i])/len(area_dist)) for i in temp_overlap_roi_inds2]
+        if (percentile_to_med2 > percentile_to_med1).any():
+            for temp_ind in temp_overlap_roi_inds2:
+                ind_remove_from_mask2.append(temp_ind)
+        else:
+            ind_remove_from_mask1.append(ind)
+
+    # repeat for multi_ind2
+    for ind in multi_ind2:
+        temp_overlap_roi_inds1 = np.where(ioa_mat1[:,ind] >= ioa_threshold)[0]
+        # pick the one(s) with closer to median area
+        percentile_to_med2 = np.abs(0.5 - np.sum(area_dist < area_dist2[ind])/len(area_dist))
+        percentile_to_med1 = [np.abs(0.5 - np.sum(area_dist < area_dist1[i])/len(area_dist)) for i in temp_overlap_roi_inds1]
+        if (percentile_to_med1 > percentile_to_med2).any():
+            for temp_ind in temp_overlap_roi_inds1:
+                ind_remove_from_mask1.append(temp_ind)
+        else:
+            ind_remove_from_mask2.append(ind)
+    for ind in ind_remove_from_mask1:
+        ioa_mat1[ind,:] = 0
+        ioa_mat2[ind,:] = 0
+    for ind in ind_remove_from_mask2:
+        ioa_mat1[:,ind] = 0
+        ioa_mat2[:,ind] = 0
+    return ind_remove_from_mask1, ind_remove_from_mask2, ioa_mat1, ioa_mat2
+
+
+def deal_with_one_to_one(ioa_mat1, ioa_mat2, mask_3d1, mask_3d2,
+                        ind_remove_from_mask1, ind_remove_from_mask2,
+                        ioa_threshold=0.5):
+    ###
+    # After multi_overlap is dealt with
+    ###
+    assert len(mask_3d1.shape) == len(mask_3d2.shape) == 3
+    assert mask_3d1.max() == mask_3d1.shape[2]
+    assert mask_3d2.max() == mask_3d2.shape[2]
+    # Sweeping through one direction is enough, because only one-to-one match (if any) is left
+    area_dist1 = np.array([np.sum(mask_3d1[i]) for i in range(mask_3d1.shape[0])])
+    area_dist2 = np.array([np.sum(mask_3d2[i]) for i in range(mask_3d2.shape[0])])
+    area_dist = np.concatenate([area_dist1, area_dist2])
+    for ind1 in range(ioa_mat1.shape[0]):
+        if (ioa_mat1[ind1,:] >= ioa_threshold).any() or (ioa_mat2[ind1,:] >= ioa_threshold).any():
+            match_ind2 = np.concatenate([np.where(ioa_mat1[ind1,:] >= ioa_threshold)[0],
+                                         np.where(ioa_mat2[ind1,:] >= ioa_threshold)[0]])
+            match_ind2 = np.unique(match_ind2)
+
+            percentile_to_med1 = np.abs(0.5 - np.sum(area_dist < area_dist1[ind1])/len(area_dist))
+            percentile_to_med2 = np.abs(0.5 - np.sum(area_dist < np.sum(area_dist2[match_ind2]))/len(area_dist))
+            # summing area_dist2 in case where there are multiple overlapping rois in mask2
+            # It's rare, but when there is, it shows neighboring ROIs that seem like one ROI
+            if percentile_to_med1 < percentile_to_med2:
+                ind_remove_from_mask2.extend(match_ind2)
+            else:
+                ind_remove_from_mask1.append(ind1)
+    return ind_remove_from_mask1, ind_remove_from_mask2
+
+
+def clean_and_merge_masks(mask_3d1, mask_3d2, ind_remove_from_mask1, ind_remove_from_mask2):
+    assert len(mask_3d1.shape) == len(mask_3d2.shape) == 3
+    assert mask_3d1.max() == mask_3d1.shape[0]
+    assert mask_3d2.max() == mask_3d2.shape[0]
+    mask_3d1 = np.delete(mask_3d1, ind_remove_from_mask1)
+    mask_3d2 = np.delete(mask_3d2, ind_remove_from_mask2)
+    mask_3d_merged = np.dstack([mask_3d1, mask_3d2])
+    return mask_3d_merged
+
 
 
 ###################################################################################################
